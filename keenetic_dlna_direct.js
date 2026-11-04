@@ -1,4 +1,4 @@
-/* Keenetic DLNA direct for Lampa 3.x / Android APK, v0.6.0 experimental.
+/* Keenetic DLNA direct for Lampa 3.x / Android APK, v0.7.1 experimental.
    Native HTTP goes directly to 192.168.2.1:8200; no PC, server or credentials.
 */
 (function () {
@@ -131,8 +131,7 @@
         var sections=Array.isArray(data)?data:[data], results=[];
         sections.forEach(function(group){
           if(group && Array.isArray(group.results)) group.results.forEach(function(it){
-            var kind=String(it.media_type || group.type || '').toLowerCase();
-            if(isSeries ? (kind==='tv' || (!kind && it.name)) : (kind==='movie' || (!kind && it.title))) results.push(it);
+            if(!isSeries || group.type==='tv' || it.media_type==='tv') results.push(it);
           });
         });
         var target=normal(info.title);
@@ -183,21 +182,34 @@
   }
   function buildLibrary(files){
     var seriesByKey={},movies=[],shows=[];
+    // DLNA can expose the same file through more than one virtual folder, and
+    // some servers publish multiple resource entries for a single episode.
+    // Collapse duplicate resource URLs before categorizing the library.
+    var seenMedia={};
     files.forEach(function(f){
+      var canonical=String(f.url||'').trim();
+      if(!canonical || seenMedia[canonical])return;
+      seenMedia[canonical]=true;
       var ep=episodeInfo(f.title,f.paths||[]);
       if(!ep){movies.push(f);return;}
       var key=(ep.title+'|'+ep.year).toLowerCase();
       if(!seriesByKey[key]){
-        seriesByKey[key]={title:ep.title,year:ep.year,folder:false,series:true,seasons:{},count:0};
+        seriesByKey[key]={title:ep.title,year:ep.year,folder:false,series:true,seasons:{},count:0,_seenEpisode:{}};
         shows.push(seriesByKey[key]);
       }
       var show=seriesByKey[key];
+      // One row per season/episode even when a NAS exposes it several times
+      // under different virtual paths or as duplicate transcoding resources.
+      // Intentionally keep the first playable DLNA URL for that episode.
+      var slot=ep.season+'x'+ep.episode;
+      if(show._seenEpisode[slot])return;
+      show._seenEpisode[slot]=true;
       if(!show.seasons[ep.season])show.seasons[ep.season]=[];
       show.seasons[ep.season].push({folder:false,title:f.title,url:f.url,episode:ep.episode,season:ep.season,episodeTitle:ep.episodeTitle});
       show.count++;
     });
     Object.keys(seriesByKey).forEach(function(key){
-      var show=seriesByKey[key];Object.keys(show.seasons).forEach(function(k){
+      var show=seriesByKey[key];delete show._seenEpisode;Object.keys(show.seasons).forEach(function(k){
         show.seasons[k].sort(function(a,b){return a.episode-b.episode || a.title.localeCompare(b.title,'ru',{numeric:true});});
       });
     });
@@ -207,7 +219,7 @@
   // Build a flattened catalogue using the existing, already-working native DLNA Browse.
   // No external bridge and no extra permissions. Limit recursion to avoid huge libraries.
   function allMovies(progress, complete, failed) {
-    var movies=[], seen={}, jobs=[], requests=0, maxRequests=300, maxDepth=12;
+    var movies=[], seen={}, seenFile={}, jobs=[], requests=0, maxRequests=300, maxDepth=12;
     function enqueue(id,depth,paths){if(!seen[id]&&depth<=maxDepth){seen[id]=true;jobs.push({id:id,depth:depth,paths:paths||[]});}}
     function walk(){
       if(!jobs.length) return complete(movies);
@@ -216,7 +228,11 @@
       browse(job.id,function(entries){
         entries.forEach(function(entry){
           if(entry.folder) enqueue(entry.id,job.depth+1,job.paths.concat([entry.title]));
-          else if(entry.url){entry.paths=job.paths;movies.push(entry);}
+          else if(entry.url && !seenFile[entry.url]){
+            seenFile[entry.url]=true;
+            entry.paths=job.paths;
+            movies.push(entry);
+          }
         });
         if(typeof progress==='function')progress(movies.length,requests);
         walk();
@@ -227,6 +243,83 @@
       if(video.length){video.forEach(function(e){enqueue(e.id,0,[]);});walk();}
       else {enqueue('0',0,[]);walk();}
     },failed);
+  }
+  // History is stored only in Lampa's local storage on this device.
+  // Entries are keyed by the exact DLNA playback URL, not by ambiguous titles.
+  var progressKey='keenetic_direct_progress_v1';
+  var progressEntries={};
+  function loadProgress(){
+    try{
+      var stored=Lampa.Storage.get(progressKey,{});
+      progressEntries=(stored&&typeof stored==='object'&&!Array.isArray(stored))?stored:{};
+    }catch(e){progressEntries={};}
+  }
+  function writeProgress(){
+    try{
+      // Keep at most 250 recent records so storage cannot grow without bound.
+      var keys=Object.keys(progressEntries).sort(function(a,b){return (progressEntries[b].updated||0)-(progressEntries[a].updated||0);});
+      keys.slice(250).forEach(function(k){delete progressEntries[k];});
+      Lampa.Storage.set(progressKey,progressEntries);
+    }catch(e){console.warn('Keenetic: progress save failed',e);}
+  }
+  function progressFor(f){return f&&f.url?progressEntries[f.url]||null:null;}
+  function formatClock(sec){
+    sec=Math.max(0,Math.floor(Number(sec)||0));
+    var h=Math.floor(sec/3600),m=Math.floor((sec%3600)/60),s=sec%60;
+    return (h?h+':':'')+(h?String(m).padStart(2,'0'):m)+':'+String(s).padStart(2,'0');
+  }
+  function progressLabel(f){
+    var p=progressFor(f);if(!p)return '';
+    if(p.watched)return '✓ Просмотрено';
+    if(p.time>=20)return 'Продолжить с '+formatClock(p.time)+(p.duration>0?' / '+formatClock(p.duration):'');
+    return 'Начато';
+  }
+  function startHistoryTracking(){
+    if(!Lampa.Player || !Lampa.Player.listener || !Lampa.PlayerVideo || !Lampa.PlayerVideo.listener)return;
+    var current=null,lastWrite=0,seeked=false;
+    function store(force,ended){
+      if(!current)return;
+      var previous=progressEntries[current.url]||{},t=Number(current.time)||0,d=Number(current.duration)||0;
+      var watched=!!ended || (d>=120 && t/d>=0.92);
+      if(!force && !watched && Date.now()-lastWrite<7000)return;
+      if(t<1 && !watched && !previous.time)return;
+      progressEntries[current.url]={url:current.url,title:current.title,time:watched?d:t,
+        duration:d,watched:watched,updated:Date.now()};
+      lastWrite=Date.now();writeProgress();
+    }
+    Lampa.Player.listener.follow('create',function(e){
+      // Only track files launched by this plugin; ignore other Lampa playback.
+      if(current)store(true,false);
+      var data=e&&e.data;
+      current=(data&&data.keenetic_direct && data.url)?{
+        url:data.url,title:data.title||'Видео',time:0,duration:0,restore:Math.max(0,Number(data.keenetic_resume)||0)
+      }:null;
+      seeked=false;lastWrite=0;
+    });
+    Lampa.PlayerVideo.listener.follow('loadeddata',function(){
+      if(!current||seeked)return;
+      seeked=true;
+      if(current.restore<15)return;
+      try{
+        var video=Lampa.PlayerVideo.video();
+        var duration=Number(video&&video.duration)||0;
+        if(duration>0 && current.restore<duration-20){
+          Lampa.PlayerVideo.to(current.restore);
+          current.time=current.restore;
+        }
+      }catch(e){console.warn('Keenetic: seek failed',e);}
+    });
+    Lampa.PlayerVideo.listener.follow('timeupdate',function(e){
+      if(!current)return;
+      var t=Number(e&&e.current),d=Number(e&&e.duration);
+      if(!isFinite(t)||t<0)return;
+      current.time=t;
+      if(isFinite(d)&&d>0)current.duration=d;
+      store(false,false);
+    });
+    Lampa.PlayerVideo.listener.follow('ended',function(){if(current)store(true,true);});
+    Lampa.Player.listener.follow('destroy',function(){if(current){store(true,false);current=null;}});
+    Lampa.Player.listener.follow('close',function(){if(current){store(true,false);current=null;}});
   }
   function Browser(){
     var self=this,html=$('<div class="keenetic-direct"><div class="keenetic-direct-title"></div><div class="keenetic-direct-list"></div></div>');
@@ -273,7 +366,12 @@
       return item;
     }
     function push(page){history.push(page);refresh();}
-    function play(f){var video={title:f.title,url:f.url};Lampa.Player.play(video);Lampa.Player.playlist([video]);}
+    function play(f, fromBeginning){
+      var old=progressFor(f), resume=(!fromBeginning&&old&&!old.watched)?Number(old.time)||0:0;
+      var video={title:f.title,url:f.url,keenetic_direct:true,keenetic_resume:resume};
+      if(fromBeginning){progressEntries[f.url]={url:f.url,title:f.title,time:0,duration:old?old.duration||0:0,watched:false,updated:Date.now()};writeProgress();}
+      Lampa.Player.play(video);Lampa.Player.playlist([video]);
+    }
     function refresh(){
       if(!active)return;
       var page=history[history.length-1],id=page.id,token=++seq;
@@ -288,17 +386,23 @@
         if(!active||token!==seq)return;
         scroll.clear();scroll.reset();
         if(id==='0')entry('🎬 Библиотека: фильмы и сериалы',function(){push({id:'__library__',title:'Библиотека'});},{icon:'🎬'});
+        if(id==='0'){
+          entry('▶ Продолжить просмотр',function(){push({id:'__continue__',title:'Продолжить просмотр'});},{icon:'▶'});
+          entry('🕘 Недавно смотрели',function(){push({id:'__recent__',title:'Недавно смотрели'});},{icon:'🕘'});
+        }
         if(items.length)entry('⇅ Сортировка: '+(sortKey==='name'?'А–Я':'как на сервере'),function(){sortKey=sortKey==='name'?'original':'name';refresh();},{icon:'⇅'});
         order(items).forEach(function(f){
           var info=f.folder?{title:f.title,year:''}:movieName(f.title);
           entry(info.title+(info.year?' ('+info.year+')':''),function(){
             if(f.folder)push({id:f.id,title:f.title});else play(f);
-          },{icon:f.folder?'📁':'▶',poster:!f.folder,title:f.title});
+          },{icon:f.folder?'📁':(progressFor(f)&&progressFor(f).watched?'✓':'▶'),poster:!f.folder,title:f.title,subtitle:f.folder?'':progressLabel(f)});
         });
         if(!items.length && id!=='0')status('Папка пуста');ready();
       }
       function renderLibrary(lib){
         if(!active||token!==seq)return;scroll.clear();scroll.reset();
+        entry('▶ Продолжить просмотр',function(){push({id:'__continue__',title:'Продолжить просмотр'});},{icon:'▶'});
+        entry('🕘 Недавно смотрели',function(){push({id:'__recent__',title:'Недавно смотрели'});},{icon:'🕘'});
         entry('📺 Сериалы ('+lib.shows.length+')',function(){push({id:'__series__',title:'Сериалы'});},{icon:'📺',subtitle:'Сериалы с разбивкой по сезонам'});
         entry('🎬 Фильмы ('+lib.movies.length+')',function(){push({id:'__movies__',title:'Фильмы'});},{icon:'🎬',subtitle:'Локальные фильмы с Keenetic'});
         entry('↻ Обновить библиотеку',function(){catalog=null;refresh();},{icon:'↻',subtitle:'Повторно найти новые файлы на диске'});
@@ -313,10 +417,26 @@
           });
           if(!lib.shows.length)status('Сериалов не найдено. Проверь формат имён серий.');
         }else if(id==='__movies__'){
-          lib.movies.forEach(function(f){var info=movieName(f.title);entry(info.title+(info.year?' ('+info.year+')':''),function(){play(f);},{icon:'🎬',poster:true,title:f.title,subtitle:'Фильм · на Keenetic'});});
+          lib.movies.forEach(function(f){var info=movieName(f.title);entry(info.title+(info.year?' ('+info.year+')':''),function(){play(f);},{icon:progressFor(f)&&progressFor(f).watched?'✓':'🎬',poster:true,title:f.title,subtitle:['Фильм · на Keenetic',progressLabel(f)].filter(Boolean).join(' · ')});});
           if(!lib.movies.length)status('Фильмов не найдено');
         }
         ready();
+      }
+      if(id==='__continue__' || id==='__recent__'){
+        scroll.clear();scroll.reset();
+        var rows=Object.keys(progressEntries).map(function(k){return progressEntries[k];}).filter(function(p){
+          return p && p.url && sameRouter(p.url) && (id==='__recent__' || (!p.watched && p.time>=20));
+        }).sort(function(a,b){return (b.updated||0)-(a.updated||0);}).slice(0,60);
+        rows.forEach(function(p){
+          var f={title:p.title,url:p.url};
+          var info=movieName(p.title);
+          entry(info.title+(info.year?' ('+info.year+')':''),function(){play(f);},{
+            icon:p.watched?'✓':'▶',poster:true,title:p.title,
+            subtitle:progressLabel(f)
+          });
+        });
+        if(!rows.length)status(id==='__recent__'?'История пока пуста':'Нет незаконченных просмотров');
+        ready();return;
       }
       if(id==='__library__' || id==='__series__' || id==='__movies__'){
         if(catalog){if(id==='__library__')renderLibrary(catalog);else showCatalog(catalog);return;}
@@ -336,7 +456,7 @@
       if(id==='__season__'){
         scroll.clear();scroll.reset();
         page.show.seasons[page.season].forEach(function(f){
-          entry('Серия '+f.episode,function(){play(f);},{icon:'▶',subtitle:f.episodeTitle||''});
+          entry('Серия '+f.episode,function(){play(f);},{icon:progressFor(f)&&progressFor(f).watched?'✓':'▶',subtitle:[f.episodeTitle||'',progressLabel(f)].filter(Boolean).join(' · ')});
         });ready();return;
       }
       browse(id,render,failed);
@@ -357,7 +477,9 @@
     this.destroy=function(){active=false;seq++;if(scroll)scroll.destroy();html.remove();};
   }
   function init(){
-    Lampa.Manifest.plugins={type:'plugin',version:'0.6.0',name:pluginName,description:'Direct UPnP/SOAP for Keenetic at 192.168.2.1, Android only',component:component};
+    loadProgress();
+    startHistoryTracking();
+    Lampa.Manifest.plugins={type:'plugin',version:'0.7.1',name:pluginName,description:'Direct UPnP/SOAP for Keenetic at 192.168.2.1, Android only',component:component};
     Lampa.Component.add(component,Browser);
     function insert(){
       if($('.menu .menu__list .keenetic-direct-entry').length)return;
