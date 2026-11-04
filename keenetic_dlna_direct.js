@@ -1,4 +1,4 @@
-/* Keenetic DLNA direct for Lampa 3.x / Android APK, v0.5.0 experimental.
+/* Keenetic DLNA direct for Lampa 3.x / Android APK, v0.5.1 experimental.
    Native HTTP goes directly to 192.168.2.1:8200; no PC, server or credentials.
 */
 (function () {
@@ -230,14 +230,27 @@
   function Browser(){
     var self=this,html=$('<div class="keenetic-direct"><div class="keenetic-direct-title"></div><div class="keenetic-direct-list"></div></div>');
     var list=html.find('.keenetic-direct-list'),title=html.find('.keenetic-direct-title');
-    var scroll=null,history=[{id:'0',title:'Keenetic'}],active=true,seq=0,catalog=null;
+    var scroll=null,lastFocus=false,history=[{id:'0',title:'Keenetic'}],active=true,seq=0,catalog=null;
     function status(msg){if(scroll){scroll.clear();scroll.append($('<div class="keenetic-direct-status"></div>').text(msg));}else list.empty().text(msg);}
     function entry(label,action,meta){
       var item=$('<div class="keenetic-direct-item selector"><span class="keenetic-direct-icon"></span><span class="keenetic-direct-name"></span></div>');
       item.find('.keenetic-direct-icon').text(meta&&meta.icon||'▶');
       item.find('.keenetic-direct-name').text(label);
+      item.on('hover:enter',action);
+      item.on('hover:focus',function(e){
+        lastFocus=e.target;
+        // Use Lampa's scroll container and immediate focus update for Android TV D-pad.
+        if(scroll) scroll.update(item,true);
+      });
+      // Insert before requesting metadata: cache hits invoke callbacks synchronously.
+      // Previously item.closest('body') was false on return from a folder, hiding posters.
+      var poster=null;
       if(meta && meta.poster){
-        var poster=$('<img class="keenetic-direct-poster" alt="">').hide();item.prepend(poster);
+        poster=$('<img class="keenetic-direct-poster" alt="">').hide();
+        item.prepend(poster);
+      }
+      scroll.append(item);
+      if(poster){
         lookupMetadata({title:meta.title||label},!!meta.series,function(data){
           if(!active || !item.closest('body').length || !data)return;
           var path=data.poster_path;
@@ -245,9 +258,6 @@
           if(data.overview)item.attr('title',data.overview);
         });
       }
-      item.on('hover:enter',action);
-      item.on('hover:focus',function(){if(scroll)scroll.update(item);});
-      scroll.append(item);
     }
     function push(page){history.push(page);refresh();}
     function play(f){var video={title:f.title,url:f.url};Lampa.Player.play(video);Lampa.Player.playlist([video]);}
@@ -255,6 +265,7 @@
       if(!active)return;
       var page=history[history.length-1],id=page.id,token=++seq;
       title.text(history.map(function(h){return h.title;}).join(' / '));
+      lastFocus=false;
       list.empty();if(scroll){scroll.destroy();scroll=null;}
       scroll=new Lampa.Scroll({mask:true,over:true});list.append(scroll.render(true));
       status('Загрузка…');self.activity.loader(true);
@@ -318,7 +329,7 @@
     this.create=function(){refresh();};
     this.start=function(){
       Lampa.Controller.add('content',{
-        invisible:true,toggle:function(){Lampa.Controller.collectionSet(html);Lampa.Controller.collectionFocus(false,html);},
+        invisible:true,toggle:function(){Lampa.Controller.collectionSet(scroll.render(true),html);Lampa.Controller.collectionFocus(lastFocus || false,scroll.render(true));},
         left:function(){if(Navigator.canmove('left'))Navigator.move('left');else Lampa.Controller.toggle('menu');},
         right:function(){Navigator.move('right');},
         up:function(){if(Navigator.canmove('up'))Navigator.move('up');else Lampa.Controller.toggle('head');},
@@ -331,14 +342,14 @@
     this.destroy=function(){active=false;seq++;if(scroll)scroll.destroy();html.remove();};
   }
   function init(){
-    Lampa.Manifest.plugins={type:'plugin',version:'0.5.0',name:pluginName,description:'Direct UPnP/SOAP for Keenetic at 192.168.2.1, Android only',component:component};
+    Lampa.Manifest.plugins={type:'plugin',version:'0.5.1',name:pluginName,description:'Direct UPnP/SOAP for Keenetic at 192.168.2.1, Android only',component:component};
     Lampa.Component.add(component,Browser);
     function insert(){
       if($('.menu .menu__list .keenetic-direct-entry').length)return;
       var button=$('<li class="menu__item selector keenetic-direct-entry"><div class="menu__ico">📁</div><div class="menu__text">Keenetic Direct</div></li>');
       button.on('hover:enter',function(){Lampa.Activity.push({url:'',title:pluginName,component:component,page:1});});
       $('.menu .menu__list').eq(0).append(button);
-      $('body').append('<style>.keenetic-direct{padding:1.5em;height:100%;box-sizing:border-box;display:flex;flex-direction:column}.keenetic-direct-title{font-size:1.35em;margin-bottom:.65em;flex:0 0 auto}.keenetic-direct-list{flex:1 1 auto;min-height:0;overflow:hidden}.keenetic-direct-item{padding:.65em 1em;margin:.35em .6em .35em 0;border-radius:.5em;background:rgba(255,255,255,.10);display:flex;align-items:center;min-height:3.4em;font-size:1.1em;box-sizing:border-box}.keenetic-direct-item.focus,.keenetic-direct-item.hover{background:#fff;color:#111}.keenetic-direct-icon{min-width:2.2em}.keenetic-direct-poster{width:3.3em;height:4.7em;object-fit:cover;margin-right:.8em;border-radius:.25em}.keenetic-direct-name{overflow:hidden;text-overflow:ellipsis;white-space:normal}.keenetic-direct-status{padding:1em;font-size:1.2em}</style>');
+      $('body').append('<style>.keenetic-direct{padding:1.5em;height:100%;box-sizing:border-box;display:flex;flex-direction:column}.keenetic-direct-title{font-size:1.35em;margin-bottom:.65em;flex:0 0 auto}.keenetic-direct-list{flex:1 1 auto;min-height:0;overflow:hidden}.keenetic-direct-list>.scroll{height:100%}.keenetic-direct-item{padding:.65em 1em;margin:.35em .6em .35em 0;border-radius:.5em;background:rgba(255,255,255,.10);display:flex;align-items:center;min-height:3.4em;font-size:1.1em;box-sizing:border-box}.keenetic-direct-item.focus,.keenetic-direct-item.hover{background:#fff;color:#111}.keenetic-direct-icon{min-width:2.2em}.keenetic-direct-poster{width:3.3em;height:4.7em;object-fit:cover;margin-right:.8em;border-radius:.25em}.keenetic-direct-name{overflow:hidden;text-overflow:ellipsis;white-space:normal}.keenetic-direct-status{padding:1em;font-size:1.2em}</style>');
     }
     if(window.appready)insert();else Lampa.Listener.follow('app',function(e){if(e.type==='ready')insert();});
   }
