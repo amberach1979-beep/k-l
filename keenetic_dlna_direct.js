@@ -1,4 +1,4 @@
-/* Keenetic DLNA direct for Lampa 3.x / Android APK, v0.5.1 experimental.
+/* Keenetic DLNA direct for Lampa 3.x / Android APK, v0.6.0 experimental.
    Native HTTP goes directly to 192.168.2.1:8200; no PC, server or credentials.
 */
 (function () {
@@ -131,7 +131,8 @@
         var sections=Array.isArray(data)?data:[data], results=[];
         sections.forEach(function(group){
           if(group && Array.isArray(group.results)) group.results.forEach(function(it){
-            if(!isSeries || group.type==='tv' || it.media_type==='tv') results.push(it);
+            var kind=String(it.media_type || group.type || '').toLowerCase();
+            if(isSeries ? (kind==='tv' || (!kind && it.name)) : (kind==='movie' || (!kind && it.title))) results.push(it);
           });
         });
         var target=normal(info.title);
@@ -233,19 +234,22 @@
     var scroll=null,lastFocus=false,history=[{id:'0',title:'Keenetic'}],active=true,seq=0,catalog=null;
     function status(msg){if(scroll){scroll.clear();scroll.append($('<div class="keenetic-direct-status"></div>').text(msg));}else list.empty().text(msg);}
     function entry(label,action,meta){
-      var item=$('<div class="keenetic-direct-item selector"><span class="keenetic-direct-icon"></span><span class="keenetic-direct-name"></span></div>');
-      item.find('.keenetic-direct-icon').text(meta&&meta.icon||'▶');
+      meta=meta||{};
+      var item=$('<div class="keenetic-direct-item selector"><span class="keenetic-direct-icon"></span><div class="keenetic-direct-details"><div class="keenetic-direct-name"></div><div class="keenetic-direct-subtitle"></div><div class="keenetic-direct-overview"></div></div></div>');
+      item.find('.keenetic-direct-icon').text(meta.icon||'▶');
       item.find('.keenetic-direct-name').text(label);
+      var subtitle=item.find('.keenetic-direct-subtitle');
+      var overview=item.find('.keenetic-direct-overview');
+      if(meta.subtitle) subtitle.text(meta.subtitle).show();else subtitle.hide();
+      if(meta.description) overview.text(meta.description).show();else overview.hide();
       item.on('hover:enter',action);
       item.on('hover:focus',function(e){
         lastFocus=e.target;
-        // Use Lampa's scroll container and immediate focus update for Android TV D-pad.
         if(scroll) scroll.update(item,true);
       });
-      // Insert before requesting metadata: cache hits invoke callbacks synchronously.
-      // Previously item.closest('body') was false on return from a folder, hiding posters.
+      // Always attach DOM before metadata lookup, including on navigation back.
       var poster=null;
-      if(meta && meta.poster){
+      if(meta.poster){
         poster=$('<img class="keenetic-direct-poster" alt="">').hide();
         item.prepend(poster);
       }
@@ -254,10 +258,19 @@
         lookupMetadata({title:meta.title||label},!!meta.series,function(data){
           if(!active || !item.closest('body').length || !data)return;
           var path=data.poster_path;
-          if(path && /^\/[a-zA-Z0-9/_\.-]+$/.test(path))poster.attr('src','https://image.tmdb.org/t/p/w185'+path).show();
-          if(data.overview)item.attr('title',data.overview);
+          if(path && /^\/[a-zA-Z0-9/_\.-]+$/.test(path)){
+            poster.attr('src','https://image.tmdb.org/t/p/w185'+path).show();
+            poster.on('error',function(){poster.hide();});
+          }
+          var year=String(data.first_air_date||data.release_date||'').slice(0,4);
+          var detail=[];
+          if(year && !/\b(?:19|20)\d{2}\b/.test(subtitle.text()))detail.push(year);
+          if(data.vote_average && Number(data.vote_average)>0)detail.push('★ '+Number(data.vote_average).toFixed(1));
+          if(detail.length)subtitle.text([subtitle.text()].concat(detail).filter(Boolean).join(' · ')).show();
+          if(data.overview){overview.text(String(data.overview).replace(/\s+/g,' ').trim().slice(0,360)).show();}
         });
       }
+      return item;
     }
     function push(page){history.push(page);refresh();}
     function play(f){var video={title:f.title,url:f.url};Lampa.Player.play(video);Lampa.Player.playlist([video]);}
@@ -286,19 +299,21 @@
       }
       function renderLibrary(lib){
         if(!active||token!==seq)return;scroll.clear();scroll.reset();
-        entry('📺 Сериалы ('+lib.shows.length+')',function(){push({id:'__series__',title:'Сериалы'});},{icon:'📺'});
-        entry('🎬 Фильмы ('+lib.movies.length+')',function(){push({id:'__movies__',title:'Фильмы'});},{icon:'🎬'});
+        entry('📺 Сериалы ('+lib.shows.length+')',function(){push({id:'__series__',title:'Сериалы'});},{icon:'📺',subtitle:'Сериалы с разбивкой по сезонам'});
+        entry('🎬 Фильмы ('+lib.movies.length+')',function(){push({id:'__movies__',title:'Фильмы'});},{icon:'🎬',subtitle:'Локальные фильмы с Keenetic'});
+        entry('↻ Обновить библиотеку',function(){catalog=null;refresh();},{icon:'↻',subtitle:'Повторно найти новые файлы на диске'});
         ready();
       }
       function showCatalog(lib){
         if(!active||token!==seq)return;scroll.clear();scroll.reset();
         if(id==='__series__'){
           lib.shows.forEach(function(show){
-            entry(show.title+(show.year?' ('+show.year+')':'')+'  ·  '+show.count+' сер.',function(){push({id:'__show__',title:show.title,show:show});},{icon:'📺',poster:true,series:true,title:show.title+(show.year?' ('+show.year+')':'')});
+            var seasonCount=Object.keys(show.seasons).length;
+            entry(show.title+(show.year?' ('+show.year+')':''),function(){push({id:'__show__',title:show.title,show:show});},{icon:'📺',poster:true,series:true,title:show.title+(show.year?' ('+show.year+')':''),subtitle:seasonCount+' сез. · '+show.count+' сер.'});
           });
           if(!lib.shows.length)status('Сериалов не найдено. Проверь формат имён серий.');
         }else if(id==='__movies__'){
-          lib.movies.forEach(function(f){var info=movieName(f.title);entry(info.title+(info.year?' ('+info.year+')':''),function(){play(f);},{icon:'🎬',poster:true,title:f.title});});
+          lib.movies.forEach(function(f){var info=movieName(f.title);entry(info.title+(info.year?' ('+info.year+')':''),function(){play(f);},{icon:'🎬',poster:true,title:f.title,subtitle:'Фильм · на Keenetic'});});
           if(!lib.movies.length)status('Фильмов не найдено');
         }
         ready();
@@ -315,13 +330,13 @@
         var seasons=Object.keys(page.show.seasons).map(Number).sort(function(a,b){return a-b;});
         seasons.forEach(function(season){
           var files=page.show.seasons[season];
-          entry('Сезон '+season+'  ·  '+files.length+' сер.',function(){push({id:'__season__',title:'Сезон '+season,show:page.show,season:season});},{icon:'📁'});
+          entry('Сезон '+season,function(){push({id:'__season__',title:'Сезон '+season,show:page.show,season:season});},{icon:'📁',subtitle:files.length+' серий'});
         });ready();return;
       }
       if(id==='__season__'){
         scroll.clear();scroll.reset();
         page.show.seasons[page.season].forEach(function(f){
-          entry('Серия '+f.episode+(f.episodeTitle?' · '+f.episodeTitle:''),function(){play(f);},{icon:'▶'});
+          entry('Серия '+f.episode,function(){play(f);},{icon:'▶',subtitle:f.episodeTitle||''});
         });ready();return;
       }
       browse(id,render,failed);
@@ -342,14 +357,14 @@
     this.destroy=function(){active=false;seq++;if(scroll)scroll.destroy();html.remove();};
   }
   function init(){
-    Lampa.Manifest.plugins={type:'plugin',version:'0.5.1',name:pluginName,description:'Direct UPnP/SOAP for Keenetic at 192.168.2.1, Android only',component:component};
+    Lampa.Manifest.plugins={type:'plugin',version:'0.6.0',name:pluginName,description:'Direct UPnP/SOAP for Keenetic at 192.168.2.1, Android only',component:component};
     Lampa.Component.add(component,Browser);
     function insert(){
       if($('.menu .menu__list .keenetic-direct-entry').length)return;
       var button=$('<li class="menu__item selector keenetic-direct-entry"><div class="menu__ico">📁</div><div class="menu__text">Keenetic Direct</div></li>');
       button.on('hover:enter',function(){Lampa.Activity.push({url:'',title:pluginName,component:component,page:1});});
       $('.menu .menu__list').eq(0).append(button);
-      $('body').append('<style>.keenetic-direct{padding:1.5em;height:100%;box-sizing:border-box;display:flex;flex-direction:column}.keenetic-direct-title{font-size:1.35em;margin-bottom:.65em;flex:0 0 auto}.keenetic-direct-list{flex:1 1 auto;min-height:0;overflow:hidden}.keenetic-direct-list>.scroll{height:100%}.keenetic-direct-item{padding:.65em 1em;margin:.35em .6em .35em 0;border-radius:.5em;background:rgba(255,255,255,.10);display:flex;align-items:center;min-height:3.4em;font-size:1.1em;box-sizing:border-box}.keenetic-direct-item.focus,.keenetic-direct-item.hover{background:#fff;color:#111}.keenetic-direct-icon{min-width:2.2em}.keenetic-direct-poster{width:3.3em;height:4.7em;object-fit:cover;margin-right:.8em;border-radius:.25em}.keenetic-direct-name{overflow:hidden;text-overflow:ellipsis;white-space:normal}.keenetic-direct-status{padding:1em;font-size:1.2em}</style>');
+      $('body').append('<style>.keenetic-direct{padding:1.5em;height:100%;box-sizing:border-box;display:flex;flex-direction:column}.keenetic-direct-title{font-size:1.35em;margin-bottom:.65em;flex:0 0 auto}.keenetic-direct-list{flex:1 1 auto;min-height:0;overflow:hidden}.keenetic-direct-list>.scroll{height:100%}.keenetic-direct-item{padding:.65em 1em;margin:.35em .6em .35em 0;border-radius:.5em;background:rgba(255,255,255,.10);display:flex;align-items:center;min-height:3.4em;font-size:1.1em;box-sizing:border-box}.keenetic-direct-item.focus,.keenetic-direct-item.hover{background:#fff;color:#111}.keenetic-direct-icon{min-width:2.2em}.keenetic-direct-poster{width:4.1em;height:6em;object-fit:cover;margin-right:1em;border-radius:.3em;flex:none}.keenetic-direct-details{min-width:0;flex:1;display:flex;flex-direction:column;gap:.17em}.keenetic-direct-name{overflow:hidden;text-overflow:ellipsis;white-space:normal;font-weight:600}.keenetic-direct-subtitle{font-size:.75em;opacity:.74}.keenetic-direct-overview{font-size:.78em;opacity:.83;line-height:1.35;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}.keenetic-direct-status{padding:1em;font-size:1.2em}</style>');
     }
     if(window.appready)insert();else Lampa.Listener.follow('app',function(e){if(e.type==='ready')insert();});
   }
