@@ -1,4 +1,4 @@
-/* Keenetic DLNA direct for Lampa 3.x / Android APK, v0.7.3 experimental.
+/* Keenetic DLNA direct for Lampa 3.x / Android APK, v0.7.5 experimental.
    Native HTTP goes directly to 192.168.2.1:8200; no PC, server or credentials.
 */
 (function () {
@@ -433,7 +433,7 @@
     function refresh(){
       if(!active)return;
       var page=history[history.length-1],id=page.id,token=++seq;
-      title.text('Keenetic Direct 0.7.3 · '+history.map(function(h){return h.title;}).join(' / '));
+      title.text('Keenetic Direct 0.7.5 · '+history.map(function(h){return h.title;}).join(' / '));
       lastFocus=false;
       list.empty();if(scroll){scroll.destroy();scroll=null;}
       scroll=new Lampa.Scroll({mask:true,over:true});list.append(scroll.render(true));
@@ -484,7 +484,7 @@
       if(id==='__diagnostic__'){
         scroll.clear();scroll.reset();
         var rows=[
-          'Версия плагина: 0.7.3',
+          'Версия плагина: 0.7.5',
           'Режим плеера: '+playbackDiagnostics.mode,
           'Событий времени: '+playbackDiagnostics.events,
           'Последняя позиция: '+formatClock(playbackDiagnostics.lastTime),
@@ -542,12 +542,10 @@
           function(){},{icon:'ℹ'});
         unique.forEach(function(f){
           var n=parseInt(f.episode,10);
-          // One identifier per episode. Prevent DOM duplication after repeated refreshes.
-          var key='keenetic-e'+n;
-          if(scroll.render(true).find('[data-keenetic-episode="'+key+'"]').length)return;
-          var item=entry('Серия '+n,function(){play(f);},
+          // unique[] already guarantees one entry per episode number.
+          // Do not call .find() on Lampa.Scroll.render(): its return type depends on the app build.
+          entry('Серия '+n,function(){play(f);},
             {icon:progressFor(f)&&progressFor(f).watched?'✓':'▶',subtitle:f.episodeTitle||''});
-          item.attr('data-keenetic-episode',key);
         });
         ready();return;
       }
@@ -572,7 +570,7 @@
     loadProgress();
     loadLaunches();
     startHistoryTracking();
-    Lampa.Manifest.plugins={type:'plugin',version:'0.7.3',name:pluginName,description:'Direct UPnP/SOAP for Keenetic at 192.168.2.1, Android only',component:component};
+    Lampa.Manifest.plugins={type:'plugin',version:'0.7.5',name:pluginName,description:'Direct UPnP/SOAP for Keenetic at 192.168.2.1, Android only',component:component};
     Lampa.Component.add(component,Browser);
     function insert(){
       if($('.menu .menu__list .keenetic-direct-entry').length)return;
