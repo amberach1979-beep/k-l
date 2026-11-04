@@ -1,4 +1,4 @@
-/* Keenetic DLNA direct for Lampa 3.x / Android APK, v0.3.0 experimental.
+/* Keenetic DLNA direct for Lampa 3.x / Android APK, v0.4.0 experimental.
    Native HTTP goes directly to 192.168.2.1:8200; no PC, server or credentials.
 */
 (function () {
@@ -141,6 +141,30 @@
       },function(){done(null);});
     }catch(e){done(null);}
   }
+  // Build a flattened catalogue using the existing, already-working native DLNA Browse.
+  // No external bridge and no extra permissions. Limit recursion to avoid huge libraries.
+  function allMovies(progress, complete, failed) {
+    var movies=[], seen={}, jobs=[], requests=0, maxRequests=300, maxDepth=12;
+    function enqueue(id,depth){if(!seen[id]&&depth<=maxDepth){seen[id]=true;jobs.push({id:id,depth:depth});}}
+    function walk(){
+      if(!jobs.length) return complete(movies);
+      if(requests>=maxRequests) return complete(movies);
+      var job=jobs.shift();requests++;
+      browse(job.id,function(entries){
+        entries.forEach(function(entry){
+          if(entry.folder) enqueue(entry.id,job.depth+1);
+          else if(entry.url) movies.push(entry);
+        });
+        if(typeof progress==='function')progress(movies.length,requests);
+        walk();
+      },failed);
+    }
+    browse('0',function(root){
+      var video=root.filter(function(e){return e.folder && /^(video|видео|films?|фильмы|movies?)$/i.test(e.title.trim());});
+      if(video.length){video.forEach(function(e){enqueue(e.id,0);});walk();}
+      else {enqueue('0',0);walk();}
+    },failed);
+  }
   function Browser(){
     var self=this, html=$('<div class="keenetic-direct"><div class="keenetic-direct-title"></div><div class="keenetic-direct-list"></div></div>');
     var list=html.find('.keenetic-direct-list'), title=html.find('.keenetic-direct-title');
@@ -149,16 +173,22 @@
     function refresh(){
       if(!active)return;
       var id=history[history.length-1].id, token=++seq;
+      html.toggleClass('keenetic-direct-catalog',id==='__all__');
       title.text(history.map(function(f){return f.title;}).join(' / ')+'  ·  Сортировка: '+(sortKey==='name'?'А–Я':'как на сервере'));
       list.empty();
       if(scroll){scroll.destroy();scroll=null;}
       scroll=new Lampa.Scroll({mask:true,over:true});list.append(scroll.render(true));
       status('Загрузка с Keenetic…');
       self.activity.loader(true);
-      browse(id,function(items){
+      var loaded=function(items){
         if(!active||token!==seq)return;
         scroll.clear();scroll.reset();
         if(!items.length) status('Папка пуста');
+        if(id==='0') {
+          var allBtn=$('<div class="keenetic-direct-item selector keenetic-direct-all">🎬 Все фильмы (общий каталог)</div>');
+          allBtn.on('hover:enter',function(){history.push({id:'__all__',title:'Все фильмы'});refresh();});
+          allBtn.on('hover:focus',function(){scroll.update(allBtn);});scroll.append(allBtn);
+        }
         if(items.length){
           var sortBtn=$('<div class="keenetic-direct-item selector keenetic-direct-sort">⇅ Сортировать: '+(sortKey==='name'?'по названию':'как на сервере')+'</div>');
           sortBtn.on('hover:enter',function(){sortKey=sortKey==='name'?'original':'name';refresh();});
@@ -188,7 +218,12 @@
           item.on('hover:focus',function(){scroll.update(item);});scroll.append(item);
         });
         self.activity.loader(false);self.activity.toggle();
-      },function(err){if(!active||token!==seq)return;self.activity.loader(false);status('Ошибка прямого подключения: '+err+'. Старый плагин с мостом можно оставить как резервный.');self.activity.toggle();});
+      };
+      var failed=function(err){if(!active||token!==seq)return;self.activity.loader(false);status('Ошибка прямого подключения: '+err+'. Старый плагин с мостом можно оставить как резервный.');self.activity.toggle();};
+      if(id==='__all__') allMovies(function(count,scanned){
+        if(active && token===seq)status('Сканирование каталога: '+count+' фильмов, '+scanned+' папок…');
+      },loaded,failed);
+      else browse(id,loaded,failed);
     }
     this.create=function(){refresh();};
     this.start=function(){
@@ -206,14 +241,14 @@
     this.destroy=function(){active=false;seq++;if(scroll)scroll.destroy();html.remove();};
   }
   function init(){
-    Lampa.Manifest.plugins={type:'plugin',version:'0.3.0',name:pluginName,description:'Direct UPnP/SOAP for Keenetic at 192.168.2.1, Android only',component:component};
+    Lampa.Manifest.plugins={type:'plugin',version:'0.4.0',name:pluginName,description:'Direct UPnP/SOAP for Keenetic at 192.168.2.1, Android only',component:component};
     Lampa.Component.add(component,Browser);
     function insert(){
       if($('.menu .menu__list .keenetic-direct-entry').length)return;
       var button=$('<li class="menu__item selector keenetic-direct-entry"><div class="menu__ico">📁</div><div class="menu__text">Keenetic Direct</div></li>');
       button.on('hover:enter',function(){Lampa.Activity.push({url:'',title:pluginName,component:component,page:1});});
       $('.menu .menu__list').eq(0).append(button);
-      $('body').append('<style>.keenetic-direct{padding:1.5em;height:100%}.keenetic-direct-title{font-size:1.4em;margin-bottom:1em}.keenetic-direct-item{padding:1em 1.3em;margin:.5em .7em .5em 0;border-radius:.5em;background:rgba(255,255,255,.10);display:flex;align-items:center;font-size:1.25em}.keenetic-direct-item.focus,.keenetic-direct-item.hover{background:#fff;color:#111}.keenetic-direct-icon{width:2em}.keenetic-direct-poster{width:3.1em;height:4.6em;object-fit:cover;margin-right:.8em;border-radius:.25em}.keenetic-direct-sort{font-size:.92em;opacity:.85}.keenetic-direct-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.keenetic-direct-status{padding:1.5em;font-size:1.2em}</style>');
+      $('body').append('<style>.keenetic-direct-catalog .keenetic-direct-list .scroll__body{display:flex;flex-wrap:wrap;align-content:flex-start}.keenetic-direct-catalog .keenetic-direct-item:not(.keenetic-direct-sort){width:14em;min-height:6em;box-sizing:border-box}.keenetic-direct{ padding:1.5em;height:100%}.keenetic-direct-title{font-size:1.4em;margin-bottom:1em}.keenetic-direct-item{padding:1em 1.3em;margin:.5em .7em .5em 0;border-radius:.5em;background:rgba(255,255,255,.10);display:flex;align-items:center;font-size:1.25em}.keenetic-direct-item.focus,.keenetic-direct-item.hover{background:#fff;color:#111}.keenetic-direct-icon{width:2em}.keenetic-direct-poster{width:3.1em;height:4.6em;object-fit:cover;margin-right:.8em;border-radius:.25em}.keenetic-direct-sort{font-size:.92em;opacity:.85}.keenetic-direct-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.keenetic-direct-status{padding:1.5em;font-size:1.2em}</style>');
     }
     if(window.appready)insert();else Lampa.Listener.follow('app',function(e){if(e.type==='ready')insert();});
   }
