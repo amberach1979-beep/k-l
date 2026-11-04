@@ -1,4 +1,4 @@
-/* Keenetic DLNA direct for Lampa 3.x / Android APK, v0.7.1 experimental.
+/* Keenetic DLNA direct for Lampa 3.x / Android APK, v0.7.2 experimental.
    Native HTTP goes directly to 192.168.2.1:8200; no PC, server or credentials.
 */
 (function () {
@@ -83,6 +83,22 @@
     }
     return items;
   }
+  function normalizedKey(s){return String(s||'').toLowerCase().replace(/\.(mkv|mp4|avi|mov|ts|m2ts|webm|mpg|mpeg)$/i,'').replace(/[._\s-]+/g,' ').trim();}
+  function dedupeFolder(items){
+    var seen={}, output=[];
+    items.forEach(function(item){
+      var key;
+      if(item.folder) key='dir:'+item.id;
+      else {
+        var ep=episodeInfo(item.title, []);
+        // DLNA may provide the same physical file under different resource URLs.
+        key=ep?'episode:'+normalizedKey(ep.title)+'|'+ep.season+'|'+ep.episode:
+          'file:'+normalizedKey(item.title);
+      }
+      if(!seen[key]){seen[key]=true;output.push(item);}
+    });
+    return output;
+  }
   function browse(id, ok,fail) {
     findControl(function(control){
       var soap='<?xml version="1.0" encoding="utf-8"?>' +
@@ -92,7 +108,7 @@
         '<Filter>*</Filter><StartingIndex>0</StartingIndex><RequestedCount>0</RequestedCount>' +
         '<SortCriteria></SortCriteria></u:Browse></s:Body></s:Envelope>';
       request(control,soap,{'Content-Type':'text/xml; charset="utf-8"','SOAPAction':SOAP_ACTION},function(raw){
-        try {ok(decodeBrowse(raw));} catch(e) {fail(e.message);}
+        try {ok(dedupeFolder(decodeBrowse(raw)));} catch(e) {fail(e.message);}
       },fail);
     },fail);
   }
@@ -248,6 +264,7 @@
   // Entries are keyed by the exact DLNA playback URL, not by ambiguous titles.
   var progressKey='keenetic_direct_progress_v1';
   var progressEntries={};
+  var playbackDiagnostics={mode:'Не проверено',events:0,lastTime:0,lastUrl:'',lastError:''};
   function loadProgress(){
     try{
       var stored=Lampa.Storage.get(progressKey,{});
@@ -274,52 +291,81 @@
     if(p.time>=20)return 'Продолжить с '+formatClock(p.time)+(p.duration>0?' / '+formatClock(p.duration):'');
     return 'Начато';
   }
+  var beginTrackedPlayback=function(){};
   function startHistoryTracking(){
-    if(!Lampa.Player || !Lampa.Player.listener || !Lampa.PlayerVideo || !Lampa.PlayerVideo.listener)return;
-    var current=null,lastWrite=0,seeked=false;
+    if(!Lampa.Player || !Lampa.Player.listener)return;
+    var current=null,lastWrite=0,seeked=false,monitor=null;
     function store(force,ended){
       if(!current)return;
       var previous=progressEntries[current.url]||{},t=Number(current.time)||0,d=Number(current.duration)||0;
       var watched=!!ended || (d>=120 && t/d>=0.92);
-      if(!force && !watched && Date.now()-lastWrite<7000)return;
-      if(t<1 && !watched && !previous.time)return;
+      if(!force && !watched && Date.now()-lastWrite<5000)return;
+      // Do not overwrite an earlier valid position with a zero reported on player shutdown.
+      if(t<1 && !watched && Number(previous.time)>0) return;
       progressEntries[current.url]={url:current.url,title:current.title,time:watched?d:t,
         duration:d,watched:watched,updated:Date.now()};
       lastWrite=Date.now();writeProgress();
     }
-    Lampa.Player.listener.follow('create',function(e){
-      // Only track files launched by this plugin; ignore other Lampa playback.
-      if(current)store(true,false);
-      var data=e&&e.data;
-      current=(data&&data.keenetic_direct && data.url)?{
-        url:data.url,title:data.title||'Видео',time:0,duration:0,restore:Math.max(0,Number(data.keenetic_resume)||0)
-      }:null;
-      seeked=false;lastWrite=0;
-    });
-    Lampa.PlayerVideo.listener.follow('loadeddata',function(){
-      if(!current||seeked)return;
-      seeked=true;
-      if(current.restore<15)return;
+    function sample(){
+      if(!current || !Lampa.PlayerVideo || typeof Lampa.PlayerVideo.video!=='function')return;
       try{
-        var video=Lampa.PlayerVideo.video();
-        var duration=Number(video&&video.duration)||0;
-        if(duration>0 && current.restore<duration-20){
-          Lampa.PlayerVideo.to(current.restore);
-          current.time=current.restore;
+        var video=Lampa.PlayerVideo.video();if(!video)return;
+        var t=Number(video.currentTime),d=Number(video.duration);
+        if(isFinite(t) && t>=0){current.time=t;playbackDiagnostics.lastTime=t;playbackDiagnostics.events++;}
+        if(isFinite(d)&&d>0)current.duration=d;
+        if(t>0) {playbackDiagnostics.mode='Встроенный видеоплеер';store(false,false);}
+        if(!seeked && current.restore>=15 && d>0 && current.restore<d-20 && video.readyState>=1){
+          seeked=true;
+          try{Lampa.PlayerVideo.to(current.restore);}catch(e){video.currentTime=current.restore;}
         }
-      }catch(e){console.warn('Keenetic: seek failed',e);}
+      }catch(e){playbackDiagnostics.lastError=String(e.message||e);}
+    }
+    function release(ended){
+      if(current){sample();store(true,!!ended);current=null;}
+      if(monitor){clearInterval(monitor);monitor=null;}
+    }
+    function arm(data){
+      if(!data || !data.url)return;
+      if(current && current.url!==data.url)release(false);
+      current={url:data.url,title:data.title||'Видео',time:0,duration:0,
+        restore:Math.max(0,Number(data.keenetic_resume)||0)};
+      seeked=false;lastWrite=0;
+      playbackDiagnostics.mode='Ожидаем запуск плеера';playbackDiagnostics.lastUrl=current.url;
+      if(!progressEntries[current.url]) {
+        progressEntries[current.url]={url:current.url,title:current.title,time:0,duration:0,watched:false,updated:Date.now()};
+        writeProgress();
+      }
+      if(monitor)clearInterval(monitor);
+      monitor=setInterval(sample,1500);
+    }
+    // Arm before Lampa.Player.play: some APK builds do not pass the original
+    // video fields along with the Player "create" event.
+    beginTrackedPlayback=arm;
+    Lampa.Player.listener.follow('create',function(e){
+      var data=e&&e.data;
+      if(data&&data.keenetic_direct&&data.url)arm(data);
+      // If no original metadata was supplied, retain the pending playback.
     });
-    Lampa.PlayerVideo.listener.follow('timeupdate',function(e){
-      if(!current)return;
-      var t=Number(e&&e.current),d=Number(e&&e.duration);
-      if(!isFinite(t)||t<0)return;
-      current.time=t;
-      if(isFinite(d)&&d>0)current.duration=d;
-      store(false,false);
+    Lampa.Player.listener.follow('external',function(data){
+      if(current && data&&data.keenetic_direct){
+        playbackDiagnostics.mode='Внешний Android-плеер: события просмотра недоступны';
+        // Android/external players must report progress separately; never falsely claim resume works.
+      }
     });
-    Lampa.PlayerVideo.listener.follow('ended',function(){if(current)store(true,true);});
-    Lampa.Player.listener.follow('destroy',function(){if(current){store(true,false);current=null;}});
-    Lampa.Player.listener.follow('close',function(){if(current){store(true,false);current=null;}});
+    if(Lampa.PlayerVideo && Lampa.PlayerVideo.listener){
+      Lampa.PlayerVideo.listener.follow('loadeddata',function(){sample();});
+      Lampa.PlayerVideo.listener.follow('timeupdate',function(e){
+        if(!current)return;
+        var t=Number(e&&e.current),d=Number(e&&e.duration);
+        if(isFinite(t)&&t>=0){current.time=t;playbackDiagnostics.lastTime=t;playbackDiagnostics.events++;}
+        if(isFinite(d)&&d>0)current.duration=d;
+        if(t>0)playbackDiagnostics.mode='Встроенный видеоплеер';
+        store(false,false);
+      });
+      Lampa.PlayerVideo.listener.follow('ended',function(){release(true);});
+    }
+    Lampa.Player.listener.follow('destroy',function(){release(false);});
+    Lampa.Player.listener.follow('close',function(){release(false);});
   }
   function Browser(){
     var self=this,html=$('<div class="keenetic-direct"><div class="keenetic-direct-title"></div><div class="keenetic-direct-list"></div></div>');
@@ -370,12 +416,13 @@
       var old=progressFor(f), resume=(!fromBeginning&&old&&!old.watched)?Number(old.time)||0:0;
       var video={title:f.title,url:f.url,keenetic_direct:true,keenetic_resume:resume};
       if(fromBeginning){progressEntries[f.url]={url:f.url,title:f.title,time:0,duration:old?old.duration||0:0,watched:false,updated:Date.now()};writeProgress();}
+      beginTrackedPlayback(video);
       Lampa.Player.play(video);Lampa.Player.playlist([video]);
     }
     function refresh(){
       if(!active)return;
       var page=history[history.length-1],id=page.id,token=++seq;
-      title.text(history.map(function(h){return h.title;}).join(' / '));
+      title.text('Keenetic Direct 0.7.2 · '+history.map(function(h){return h.title;}).join(' / '));
       lastFocus=false;
       list.empty();if(scroll){scroll.destroy();scroll=null;}
       scroll=new Lampa.Scroll({mask:true,over:true});list.append(scroll.render(true));
@@ -389,6 +436,7 @@
         if(id==='0'){
           entry('▶ Продолжить просмотр',function(){push({id:'__continue__',title:'Продолжить просмотр'});},{icon:'▶'});
           entry('🕘 Недавно смотрели',function(){push({id:'__recent__',title:'Недавно смотрели'});},{icon:'🕘'});
+          entry('⚙ Диагностика просмотра',function(){push({id:'__diagnostic__',title:'Диагностика'});},{icon:'⚙'});
         }
         if(items.length)entry('⇅ Сортировка: '+(sortKey==='name'?'А–Я':'как на сервере'),function(){sortKey=sortKey==='name'?'original':'name';refresh();},{icon:'⇅'});
         order(items).forEach(function(f){
@@ -421,6 +469,20 @@
           if(!lib.movies.length)status('Фильмов не найдено');
         }
         ready();
+      }
+      if(id==='__diagnostic__'){
+        scroll.clear();scroll.reset();
+        var rows=[
+          'Версия плагина: 0.7.2',
+          'Режим плеера: '+playbackDiagnostics.mode,
+          'Событий времени: '+playbackDiagnostics.events,
+          'Последняя позиция: '+formatClock(playbackDiagnostics.lastTime),
+          'Сохранено записей: '+Object.keys(progressEntries).length,
+          'Последний URL: '+(playbackDiagnostics.lastUrl||'не запускался'),
+          'Ошибка: '+(playbackDiagnostics.lastError||'нет')
+        ];
+        rows.forEach(function(r){entry(r,function(){},{icon:'•'});});
+        ready();return;
       }
       if(id==='__continue__' || id==='__recent__'){
         scroll.clear();scroll.reset();
@@ -455,9 +517,15 @@
       }
       if(id==='__season__'){
         scroll.clear();scroll.reset();
+        var uniqueEpisodes={}, deduped=0;
         page.show.seasons[page.season].forEach(function(f){
+          var episodeNumber=Number(f.episode);
+          if(uniqueEpisodes[episodeNumber]){deduped++;return;}
+          uniqueEpisodes[episodeNumber]=true;
           entry('Серия '+f.episode,function(){play(f);},{icon:progressFor(f)&&progressFor(f).watched?'✓':'▶',subtitle:[f.episodeTitle||'',progressLabel(f)].filter(Boolean).join(' · ')});
-        });ready();return;
+        });
+        if(deduped) entry('Скрыто повторов: '+deduped,function(){},{icon:'ℹ'});
+        ready();return;
       }
       browse(id,render,failed);
     }
@@ -479,7 +547,7 @@
   function init(){
     loadProgress();
     startHistoryTracking();
-    Lampa.Manifest.plugins={type:'plugin',version:'0.7.1',name:pluginName,description:'Direct UPnP/SOAP for Keenetic at 192.168.2.1, Android only',component:component};
+    Lampa.Manifest.plugins={type:'plugin',version:'0.7.2',name:pluginName,description:'Direct UPnP/SOAP for Keenetic at 192.168.2.1, Android only',component:component};
     Lampa.Component.add(component,Browser);
     function insert(){
       if($('.menu .menu__list .keenetic-direct-entry').length)return;
